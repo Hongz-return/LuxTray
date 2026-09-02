@@ -8,7 +8,7 @@ Requirements:
 
 - Windows 10/11
 - Rust **1.85+** (`rust-version` in `Cargo.toml`)
-- Optional: [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer (Chinese language file: `compiler:Languages\ChineseSimplified.isl`)
+- Optional: [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer (简体中文语言文件在 `pack/ChineseSimplified.isl`，适配 6.5+)
 
 ```powershell
 cargo fmt --all
