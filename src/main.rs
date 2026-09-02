@@ -25,6 +25,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 fn main() {
+    install_panic_hook();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -75,6 +76,47 @@ fn main() {
             );
         }
     }
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let body = format!("{}  {loc}\n{payload}\n", chrono_like_now());
+        if let Ok(base) = std::env::var("APPDATA") {
+            let dir = std::path::PathBuf::from(base).join("LuxTray");
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                let _ = write!(f, "{body}");
+            }
+        }
+        let text = "LuxTray 已异常退出。详情见 %APPDATA%\\LuxTray\\panic.log";
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let mut title: Vec<u16> = "LuxTray".encode_utf16().collect();
+        title.push(0);
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::core::PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }));
 }
 
 fn log_launch(msg: &str) {

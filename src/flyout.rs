@@ -7,22 +7,21 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
     InvalidateRect, Rectangle, SelectObject, SetBkMode, SetTextColor, TextOutW, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
-    OUT_TT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT, HBRUSH, HFONT,
+    HBRUSH, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, GetWindowLongPtrW,
-    LoadCursorW, MoveWindow, RegisterClassExW, SetWindowPos, ShowWindow, CS_DROPSHADOW,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, SM_CXSCREEN,
-    SM_CYCAPTION, SM_CYSCREEN, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_CLOSE, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, LoadCursorW, MoveWindow,
+    RegisterClassExW, SetWindowPos, ShowWindow, CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, HWND_TOPMOST, IDC_ARROW, SM_CXSCREEN, SM_CYCAPTION, SM_CYSCREEN, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WNDCLASSEXW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
 };
 
-use crate::app::App;
+use crate::app;
 
 pub const CLASS: windows::core::PCWSTR = w!("LuxTrayFlyout");
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -229,15 +228,6 @@ fn level_from_x(track: RECT, x: i32) -> i16 {
     ) as i16
 }
 
-unsafe fn app_from(hwnd: HWND) -> Option<&'static mut App> {
-    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-    if p.is_null() {
-        None
-    } else {
-        Some(&mut *p)
-    }
-}
-
 unsafe extern "system" fn flyout_proc(
     hwnd: HWND,
     msg: u32,
@@ -250,7 +240,7 @@ unsafe extern "system" fn flyout_proc(
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            if let Some(app) = app_from(hwnd) {
+            app::with_app(hwnd, |app| {
                 let x = (lparam.0 as i16) as i32;
                 let y = ((lparam.0 >> 16) as i16) as i32;
                 let (_, hits) = layout_rows(hwnd, app.monitors.len());
@@ -268,11 +258,11 @@ unsafe extern "system" fn flyout_proc(
                         break;
                     }
                 }
-            }
+            });
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if let Some(app) = app_from(hwnd) {
+            app::with_app(hwnd, |app| {
                 if let Some(idx) = app.drag_row {
                     let x = (lparam.0 as i16) as i32;
                     let (_, hits) = layout_rows(hwnd, app.monitors.len());
@@ -290,13 +280,13 @@ unsafe extern "system" fn flyout_proc(
                     };
                     let _ = TrackMouseEvent(&mut tme);
                 }
-            }
+            });
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_LBUTTONUP | WM_MOUSELEAVE => {
-            if let Some(app) = app_from(hwnd) {
+            app::with_app(hwnd, |app| {
                 app.drag_row = None;
-            }
+            });
             let _ = ReleaseCapture();
             windows::Win32::Foundation::LRESULT(0)
         }
@@ -305,13 +295,13 @@ unsafe extern "system" fn flyout_proc(
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            if let Some(app) = app_from(hwnd) {
+            app::with_app(hwnd, |app| {
                 let delta = (wparam.0 >> 16) as i16;
                 let step = app.config.step as i16;
                 let d = if delta > 0 { step } else { -step };
                 app.offset_all(d);
                 let _ = InvalidateRect(Some(hwnd), None, true);
-            }
+            });
             windows::Win32::Foundation::LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -319,10 +309,11 @@ unsafe extern "system" fn flyout_proc(
 }
 
 fn paint(hwnd: HWND) {
+    let _ = app::with_app(hwnd, |app| paint_inner(hwnd, app));
+}
+
+fn paint_inner(hwnd: HWND, app: &crate::app::App) {
     unsafe {
-        let Some(app) = app_from(hwnd) else {
-            return;
-        };
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         let theme = Theme::current();
@@ -380,7 +371,7 @@ fn paint(hwnd: HWND) {
 
             // track
             let track_brush = CreateSolidBrush(theme.track);
-            fill_roundish(hdc, hit.track, track_brush, theme.track);
+            fill_roundish(hdc, hit.track, track_brush);
 
             let w = (hit.track.right - hit.track.left).max(1);
             let span = (crate::monitors::LEVEL_MAX - crate::monitors::LEVEL_MIN) as i32;
@@ -394,7 +385,7 @@ fn paint(hwnd: HWND) {
                     bottom: hit.track.bottom,
                 };
                 let ab = CreateSolidBrush(theme.accent);
-                fill_roundish(hdc, fill, ab, theme.accent);
+                fill_roundish(hdc, fill, ab);
                 let _ = DeleteObject(ab.into());
             }
 
@@ -432,7 +423,12 @@ fn paint(hwnd: HWND) {
 
             SetTextColor(hdc, theme.muted);
             let pct = format!("{}", row.1);
-            text_out(hdc, hit.track.right + scale(8), hit.track.top - scale(2), &pct);
+            text_out(
+                hdc,
+                hit.track.right + scale(8),
+                hit.track.top - scale(2),
+                &pct,
+            );
         }
 
         SelectObject(hdc, old_font);
@@ -443,10 +439,9 @@ fn paint(hwnd: HWND) {
     }
 }
 
-fn fill_roundish(hdc: windows::Win32::Graphics::Gdi::HDC, rc: RECT, brush: HBRUSH, color: COLORREF) {
+fn fill_roundish(hdc: windows::Win32::Graphics::Gdi::HDC, rc: RECT, brush: HBRUSH) {
     unsafe {
         FillRect(hdc, &rc, brush);
-        let _ = color;
     }
 }
 
@@ -457,7 +452,11 @@ fn make_font(px: i32, bold: bool) -> HFONT {
             0,
             0,
             0,
-            if bold { FW_SEMIBOLD.0 as i32 } else { FW_NORMAL.0 as i32 },
+            if bold {
+                FW_SEMIBOLD.0 as i32
+            } else {
+                FW_NORMAL.0 as i32
+            },
             0,
             0,
             0,
@@ -475,5 +474,37 @@ fn text_out(hdc: windows::Win32::Graphics::Gdi::HDC, x: i32, y: i32, s: &str) {
     let wide: Vec<u16> = s.encode_utf16().collect();
     unsafe {
         let _ = TextOutW(hdc, x, y, &wide);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::level_from_x;
+    use crate::monitors::{LEVEL_MAX, LEVEL_MIN};
+    use windows::Win32::Foundation::RECT;
+
+    fn track(left: i32, right: i32) -> RECT {
+        RECT {
+            left,
+            top: 0,
+            right,
+            bottom: 10,
+        }
+    }
+
+    #[test]
+    fn level_from_x_ends() {
+        let t = track(0, 150);
+        assert_eq!(level_from_x(t, 0), LEVEL_MIN);
+        assert_eq!(level_from_x(t, 150), LEVEL_MAX);
+        assert_eq!(level_from_x(t, -10), LEVEL_MIN);
+        assert_eq!(level_from_x(t, 999), LEVEL_MAX);
+    }
+
+    #[test]
+    fn level_from_x_zero_at_one_third() {
+        let t = track(0, 150);
+        // LEVEL_MIN=-50, LEVEL_MAX=100, span=150; zero is at t=50/150
+        assert_eq!(level_from_x(t, 50), 0);
     }
 }

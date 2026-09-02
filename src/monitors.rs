@@ -1,16 +1,16 @@
 use anyhow::Result;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::rc::Rc;
+use windows::core::BOOL;
 use windows::Win32::Devices::Display::{
     DestroyPhysicalMonitors, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
-    GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
-    GetPhysicalMonitorsFromHMONITOR, QueryDisplayConfig, SetMonitorBrightness,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, PHYSICAL_MONITOR,
-    QDC_ONLY_ACTIVE_PATHS,
+    GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
+    QueryDisplayConfig, SetMonitorBrightness, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, PHYSICAL_MONITOR, QDC_ONLY_ACTIVE_PATHS,
 };
-use windows::core::BOOL;
 use windows::Win32::Foundation::{HANDLE, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFOEXW,
@@ -43,9 +43,38 @@ pub fn extra_alpha(level: i16) -> u8 {
     (extra * 170 / (-LEVEL_MIN) as u32) as u8
 }
 
+/// Owns a DDC/CI physical-monitor handle and releases it with
+/// `DestroyPhysicalMonitors` (shared via `Rc` so `Monitor` stays `Clone`).
+pub struct DdcHandle {
+    inner: PHYSICAL_MONITOR,
+}
+
+impl std::fmt::Debug for DdcHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let handle = self.inner.hPhysicalMonitor;
+        f.debug_struct("DdcHandle")
+            .field("handle", &handle.0)
+            .finish()
+    }
+}
+
+impl Drop for DdcHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyPhysicalMonitors(&[self.inner]);
+        }
+    }
+}
+
+impl DdcHandle {
+    fn handle(&self) -> HANDLE {
+        self.inner.hPhysicalMonitor
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Backend {
-    Ddc { handle: isize },
+    Ddc { handle: Rc<DdcHandle> },
     Wmi { instance_name: String },
 }
 
@@ -65,7 +94,7 @@ impl Monitor {
         let pct = pct.min(100);
         match &self.backend {
             Backend::Ddc { handle } => {
-                let handle = HANDLE(*handle as *mut core::ffi::c_void);
+                let handle = handle.handle();
                 let span = self.max.saturating_sub(self.min);
                 let raw = self.min + span * pct as u32 / 100;
                 unsafe {
@@ -79,19 +108,16 @@ impl Monitor {
         }
     }
 
-    #[allow(dead_code)]
     pub fn refresh(&mut self) -> Result<()> {
         self.current = read_percent(self)? as i16;
         Ok(())
     }
 }
 
-#[allow(dead_code)]
 fn read_percent(mon: &Monitor) -> Result<u8> {
     match &mon.backend {
         Backend::Ddc { handle } => {
-            let handle = HANDLE(*handle as *mut core::ffi::c_void);
-            let (min, cur, max) = ddc_get(handle)?;
+            let (min, cur, max) = ddc_get(handle.handle())?;
             Ok(normalize(cur, min, max))
         }
         Backend::Wmi { instance_name } => wmi_brightness::get(instance_name),
@@ -130,7 +156,6 @@ pub fn enumerate() -> Result<Vec<Monitor>> {
     let wmi_panels = wmi_brightness::list().unwrap_or_default();
     let mut used_wmi = vec![false; wmi_panels.len()];
     let mut out = Vec::new();
-    let mut physical_keep: Vec<PHYSICAL_MONITOR> = Vec::new();
 
     for (idx, hmon) in hmons.into_iter().enumerate() {
         let gdi = monitor_gdi_name(hmon).unwrap_or_else(|| format!("DISPLAY{}", idx + 1));
@@ -152,7 +177,7 @@ pub fn enumerate() -> Result<Vec<Monitor>> {
         }
 
         let mut claimed_ddc = false;
-        for (pidx, phys) in physicals.iter().enumerate() {
+        for (pidx, phys) in physicals.into_iter().enumerate() {
             let handle = phys.hPhysicalMonitor;
             match ddc_get(handle) {
                 Ok((min, cur, max)) => {
@@ -166,32 +191,31 @@ pub fn enumerate() -> Result<Vec<Monitor>> {
                         let raw = phys.szPhysicalMonitorDescription;
                         utf16_z(&raw)
                     };
-                    let name = if !desc.is_empty()
-                        && !desc.eq_ignore_ascii_case("Generic PnP Monitor")
-                    {
-                        desc
-                    } else {
-                        friendly.clone()
-                    };
+                    let name =
+                        if !desc.is_empty() && !desc.eq_ignore_ascii_case("Generic PnP Monitor") {
+                            desc
+                        } else {
+                            friendly.clone()
+                        };
                     out.push(Monitor {
                         id,
                         name,
                         backend: Backend::Ddc {
-                            handle: handle.0 as isize,
+                            handle: Rc::new(DdcHandle { inner: phys }),
                         },
                         min,
                         max,
                         current: normalize(cur, min, max) as i16,
                         rect,
                     });
-                    physical_keep.push(*phys);
                 }
-                Err(_) => {}
+                Err(_) => unsafe {
+                    let _ = DestroyPhysicalMonitors(&[phys]);
+                },
             }
         }
 
         if !claimed_ddc {
-            let _ = unsafe { DestroyPhysicalMonitors(&physicals) };
             if let Some(i) = match_wmi(&wmi_panels, &device_path, &used_wmi) {
                 used_wmi[i] = true;
                 out.push(wmi_monitor(&wmi_panels[i], &friendly, idx, rect));
@@ -213,7 +237,6 @@ pub fn enumerate() -> Result<Vec<Monitor>> {
         out.push(wmi_monitor(panel, "内置屏幕", out.len(), primary_rect()));
     }
 
-    let _ = physical_keep;
     Ok(out)
 }
 
@@ -324,7 +347,9 @@ fn monitor_gdi_name(hmon: HMONITOR) -> Option<String> {
     unsafe {
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        GetMonitorInfoW(hmon, &mut info as *mut _ as *mut _).as_bool().then_some(())?;
+        GetMonitorInfoW(hmon, &mut info as *mut _ as *mut _)
+            .as_bool()
+            .then_some(())?;
         Some(utf16_z(&info.szDevice))
     }
 }
@@ -428,3 +453,45 @@ pub fn offset_all(monitors: &mut [Monitor], delta: i16) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_level_bounds() {
+        assert_eq!(clamp_level(-100), LEVEL_MIN);
+        assert_eq!(clamp_level(LEVEL_MIN), LEVEL_MIN);
+        assert_eq!(clamp_level(0), 0);
+        assert_eq!(clamp_level(50), 50);
+        assert_eq!(clamp_level(LEVEL_MAX), LEVEL_MAX);
+        assert_eq!(clamp_level(200), LEVEL_MAX);
+    }
+
+    #[test]
+    fn hardware_percent_maps_extra_dim_to_zero() {
+        assert_eq!(hardware_percent(-50), 0);
+        assert_eq!(hardware_percent(-1), 0);
+        assert_eq!(hardware_percent(0), 0);
+        assert_eq!(hardware_percent(1), 1);
+        assert_eq!(hardware_percent(100), 100);
+        assert_eq!(hardware_percent(127), 100);
+    }
+
+    #[test]
+    fn extra_alpha_only_below_zero() {
+        assert_eq!(extra_alpha(100), 0);
+        assert_eq!(extra_alpha(0), 0);
+        assert_eq!(extra_alpha(-1), 3);
+        assert_eq!(extra_alpha(LEVEL_MIN), 170);
+    }
+
+    #[test]
+    fn normalize_brightness_span() {
+        assert_eq!(normalize(0, 0, 0), 0);
+        assert_eq!(normalize(50, 100, 50), 0);
+        assert_eq!(normalize(0, 0, 100), 0);
+        assert_eq!(normalize(50, 0, 100), 50);
+        assert_eq!(normalize(100, 0, 100), 100);
+        assert_eq!(normalize(75, 50, 150), 25);
+    }
+}

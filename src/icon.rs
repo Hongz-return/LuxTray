@@ -1,5 +1,5 @@
 use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, GetDC, ReleaseDC};
-use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, ICONINFO, HICON};
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
 
 pub fn create_sun_icon(size: i32) -> anyhow::Result<HICON> {
     let s = size.max(16) as usize;

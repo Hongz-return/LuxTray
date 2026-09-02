@@ -39,7 +39,6 @@ pub fn list() -> Result<Vec<WmiPanel>> {
         .collect())
 }
 
-#[allow(dead_code)]
 pub fn get(instance_name: &str) -> Result<u8> {
     let panels = list()?;
     panels
@@ -58,11 +57,7 @@ pub fn set(instance_name: &str, brightness: u8) -> Result<()> {
         brightness: brightness.min(100),
     };
     let _: () = con
-        .exec_instance_method::<WmiMonitorBrightnessMethods, ()>(
-            &path,
-            "WmiSetBrightness",
-            input,
-        )
+        .exec_instance_method::<WmiMonitorBrightnessMethods, ()>(&path, "WmiSetBrightness", input)
         .or_else(|_| {
             // Some providers return a ReturnValue instead of void.
             #[derive(Deserialize)]

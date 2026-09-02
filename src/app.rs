@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use windows::core::w;
@@ -12,9 +13,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    KillTimer, LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
-    MSG, WM_APP, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POWERBROADCAST, WM_TIMER,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG,
+    WM_APP, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POWERBROADCAST, WM_TIMER,
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -32,7 +33,12 @@ const TIMER_FLUSH: usize = 1;
 const TIMER_RESCAN: usize = 2;
 const TIMER_RESTORE: usize = 3;
 const TIMER_CLICKAWAY: usize = 4;
+const TIMER_POLL: usize = 5;
 pub const WM_SHOW_FLYOUT: u32 = WM_APP + 2;
+
+thread_local! {
+    static APP_BORROWED: Cell<bool> = const { Cell::new(false) };
+}
 
 const ID_REFRESH: u32 = 1001;
 const ID_AUTOSTART: u32 = 1002;
@@ -87,11 +93,8 @@ impl App {
         self.update_tooltip();
         if flyout::is_visible(self.flyout) {
             unsafe {
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(
-                    Some(self.flyout),
-                    None,
-                    true,
-                );
+                let _ =
+                    windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.flyout), None, true);
             }
         }
     }
@@ -121,18 +124,15 @@ impl App {
             .iter()
             .map(|m| (m.id.clone(), m.current))
             .collect();
-        match monitors::enumerate() {
-            Ok(mut list) => {
-                for m in &mut list {
-                    if let Some(&lvl) = prev.get(&m.id) {
-                        m.current = lvl;
-                    } else if let Some(&lvl) = self.config.last_brightness.get(&m.id) {
-                        m.current = lvl;
-                    }
+        if let Ok(mut list) = monitors::enumerate() {
+            for m in &mut list {
+                if let Some(&lvl) = prev.get(&m.id) {
+                    m.current = lvl;
+                } else if let Some(&lvl) = self.config.last_brightness.get(&m.id) {
+                    m.current = lvl;
                 }
-                self.monitors = list;
             }
-            Err(_) => {}
+            self.monitors = list;
         }
         self.sync_dim();
         self.update_tooltip();
@@ -190,15 +190,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
-    fn toggle_flyout(&mut self) {
-        if flyout::is_visible(self.flyout) {
-            self.hide_flyout();
-            return;
-        }
-        self.open_flyout();
-    }
-
     fn tray_left_click(&mut self) {
         let now = Instant::now();
         if self
@@ -209,10 +200,38 @@ impl App {
             return;
         }
         self.last_tray_open = Some(now);
-        self.open_flyout();
+        if flyout::is_visible(self.flyout) {
+            self.hide_flyout();
+        } else {
+            self.open_flyout();
+        }
+    }
+
+    fn refresh_from_hardware(&mut self) {
+        if self.drag_row.is_some() {
+            return;
+        }
+        let mut changed = false;
+        for m in &mut self.monitors {
+            if self.pending.contains_key(&m.id) {
+                continue;
+            }
+            let prev = m.current;
+            if prev < 0 {
+                continue;
+            }
+            if m.refresh().is_ok() && m.current != prev {
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_dim();
+            self.update_tooltip();
+        }
     }
 
     fn open_flyout(&mut self) {
+        self.refresh_from_hardware();
         let rc = self
             .tray
             .as_ref()
@@ -231,6 +250,7 @@ impl App {
         self.clickaway_arm = Some(Instant::now() + Duration::from_millis(2000));
         unsafe {
             let _ = SetTimer(Some(self.hwnd), TIMER_CLICKAWAY, 50, None);
+            let _ = SetTimer(Some(self.hwnd), TIMER_POLL, 2000, None);
         }
     }
 
@@ -239,6 +259,7 @@ impl App {
         self.clickaway_arm = None;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CLICKAWAY);
+            let _ = KillTimer(Some(self.hwnd), TIMER_POLL);
         }
     }
 
@@ -280,22 +301,23 @@ impl App {
             .unwrap_or(false)
     }
 
-    fn show_menu(&self) {
-        let auto = if self.config.autostart { "*" } else { "" };
+    fn menu_items(&self) -> Vec<(String, u32)> {
+        let auto = if crate::autostart::is_enabled() {
+            "*"
+        } else {
+            ""
+        };
         let hk = if self.config.hotkeys_enabled { "*" } else { "" };
         let rs = if self.config.restore_on_wake { "*" } else { "" };
-        tray::show_context_menu(
-            self.hwnd,
-            &[
-                ("刷新显示器", ID_REFRESH),
-                ("", 0),
-                (&format!("{auto}开机启动"), ID_AUTOSTART),
-                (&format!("{hk}快捷键 Ctrl+Alt+↑/↓"), ID_HOTKEYS),
-                (&format!("{rs}唤醒后恢复亮度"), ID_RESTORE),
-                ("", 0),
-                ("退出 LuxTray", ID_EXIT),
-            ],
-        );
+        vec![
+            ("刷新显示器".into(), ID_REFRESH),
+            (String::new(), 0),
+            (format!("{auto}开机启动"), ID_AUTOSTART),
+            (format!("{hk}快捷键 Ctrl+Alt+↑/↓"), ID_HOTKEYS),
+            (format!("{rs}唤醒后恢复亮度"), ID_RESTORE),
+            (String::new(), 0),
+            ("退出 LuxTray".into(), ID_EXIT),
+        ]
     }
 
     fn set_hotkeys(&self, enable: bool) {
@@ -347,9 +369,19 @@ pub fn run() -> Result<()> {
     let icon_handle = icon::create_sun_icon(32)?;
     let tray = TrayIcon::add(hwnd, icon_handle, "LuxTray")?;
 
-    let config = Config::load();
-    if config.autostart {
-        let _ = crate::autostart::set_enabled(true);
+    let mut config = Config::load();
+    match crate::autostart::sync_on_launch(config.autostart) {
+        Ok(effective) => {
+            if effective != config.autostart {
+                config.autostart = effective;
+                let _ = config.save();
+            }
+        }
+        Err(_) => {
+            if config.autostart {
+                let _ = crate::autostart::set_enabled(true);
+            }
+        }
     }
 
     let monitors = monitors::enumerate().unwrap_or_default();
@@ -424,14 +456,26 @@ fn register_hidden_class() -> Result<()> {
     }
 }
 
-unsafe fn app_from(hwnd: HWND) -> Option<&'static mut App> {
-    let p = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
-        as *mut App;
+/// Borrow `App` from `GWLP_USERDATA` with a reentrancy guard so nested modal
+/// loops (e.g. `TrackPopupMenu`) cannot create overlapping `&mut App`.
+pub(crate) fn with_app<R>(hwnd: HWND, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
     if p.is_null() {
-        None
-    } else {
-        Some(&mut *p)
+        return None;
     }
+    if APP_BORROWED.with(|c| c.replace(true)) {
+        return None;
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            APP_BORROWED.with(|c| c.set(false));
+        }
+    }
+    let _guard = Guard;
+    // SAFETY: `p` is the Box<App> stored for the window lifetime; the Cell
+    // prevents a second &mut while this call is active.
+    Some(f(unsafe { &mut *p }))
 }
 
 fn pt_in_rect(rc: RECT, pt: POINT) -> bool {
@@ -448,100 +492,117 @@ fn pt_in_hwnd(hwnd: HWND, pt: POINT) -> bool {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_SHOW_FLYOUT => {
-            if let Some(app) = app_from(hwnd) {
-                app.open_flyout();
-            }
+            with_app(hwnd, |app| app.open_flyout());
             LRESULT(0)
         }
         WM_TRAY => {
             let event = (lparam.0 as u32) & 0xFFFF;
-            if let Some(app) = app_from(hwnd) {
-                const NIN_SELECT: u32 = 0x0400;
-                const NIN_KEYSELECT: u32 = 0x0401;
-                match event {
-                    NIN_SELECT | NIN_KEYSELECT => {
-                        app.tray_left_click();
-                    }
-                    windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU
-                    | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
-                    | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN => {
+            const NIN_SELECT: u32 = 0x0400;
+            const NIN_KEYSELECT: u32 = 0x0401;
+            match event {
+                NIN_SELECT | NIN_KEYSELECT => {
+                    with_app(hwnd, |app| app.tray_left_click());
+                }
+                windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU
+                | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
+                | windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN => {
+                    let items = with_app(hwnd, |app| {
                         app.hide_flyout();
-                        app.show_menu();
+                        app.menu_items()
+                    });
+                    if let Some(items) = items {
+                        tray::show_context_menu(hwnd, &items);
                     }
-                    windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+                }
+                windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+                    with_app(hwnd, |app| {
                         let delta = ((wparam.0 >> 16) as i16).signum() * app.config.step as i16;
                         if delta != 0 {
                             app.offset_all(delta);
                         }
-                    }
-                    _ => {}
+                    });
                 }
+                _ => {}
             }
             LRESULT(0)
         }
         WM_COMMAND => {
             let id = (wparam.0 as u32) & 0xFFFF;
-            if let Some(app) = app_from(hwnd) {
-                match id {
-                    ID_REFRESH => app.rescan(),
-                    ID_AUTOSTART => {
-                        app.config.autostart = !app.config.autostart;
-                        let _ = crate::autostart::set_enabled(app.config.autostart);
-                        let _ = app.config.save();
-                    }
-                    ID_HOTKEYS => {
-                        app.config.hotkeys_enabled = !app.config.hotkeys_enabled;
-                        app.set_hotkeys(app.config.hotkeys_enabled);
-                        let _ = app.config.save();
-                    }
-                    ID_RESTORE => {
-                        app.config.restore_on_wake = !app.config.restore_on_wake;
-                        let _ = app.config.save();
-                    }
-                    ID_EXIT => {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    _ => {}
+            let exit = with_app(hwnd, |app| match id {
+                ID_REFRESH => {
+                    app.rescan();
+                    false
                 }
+                ID_AUTOSTART => {
+                    app.config.autostart = !app.config.autostart;
+                    let _ = crate::autostart::set_enabled(app.config.autostart);
+                    let _ = app.config.save();
+                    false
+                }
+                ID_HOTKEYS => {
+                    app.config.hotkeys_enabled = !app.config.hotkeys_enabled;
+                    app.set_hotkeys(app.config.hotkeys_enabled);
+                    let _ = app.config.save();
+                    false
+                }
+                ID_RESTORE => {
+                    app.config.restore_on_wake = !app.config.restore_on_wake;
+                    let _ = app.config.save();
+                    false
+                }
+                ID_EXIT => true,
+                _ => false,
+            })
+            .unwrap_or(false);
+            if exit {
+                let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
         WM_HOTKEY => {
-            if let Some(app) = app_from(hwnd) {
+            with_app(hwnd, |app| {
                 let step = app.config.step as i16;
                 match wparam.0 as i32 {
                     HOTKEY_UP => app.offset_all(step),
                     HOTKEY_DOWN => app.offset_all(-step),
                     _ => {}
                 }
-            }
+            });
             LRESULT(0)
         }
         WM_TIMER => {
-            if let Some(app) = app_from(hwnd) {
-                match wparam.0 {
-                    TIMER_FLUSH => {
-                        let _ = KillTimer(Some(hwnd), TIMER_FLUSH);
-                        app.flush_pending();
-                    }
-                    TIMER_RESCAN => {
-                        let _ = KillTimer(Some(hwnd), TIMER_RESCAN);
-                        app.rescan();
-                    }
-                    TIMER_RESTORE => {
-                        let _ = KillTimer(Some(hwnd), TIMER_RESTORE);
-                        if app.config.restore_on_wake {
-                            app.rescan();
-                            app.restore_saved();
-                        }
-                    }
-                    TIMER_CLICKAWAY => app.poll_clickaway(),
-                    _ => {}
+            with_app(hwnd, |app| match wparam.0 {
+                TIMER_FLUSH => {
+                    let _ = KillTimer(Some(hwnd), TIMER_FLUSH);
+                    app.flush_pending();
                 }
-            }
+                TIMER_RESCAN => {
+                    let _ = KillTimer(Some(hwnd), TIMER_RESCAN);
+                    app.rescan();
+                }
+                TIMER_RESTORE => {
+                    let _ = KillTimer(Some(hwnd), TIMER_RESTORE);
+                    if app.config.restore_on_wake {
+                        app.rescan();
+                        app.restore_saved();
+                    }
+                }
+                TIMER_CLICKAWAY => app.poll_clickaway(),
+                TIMER_POLL if flyout::is_visible(app.flyout) => {
+                    app.refresh_from_hardware();
+                    let _ =
+                        windows::Win32::Graphics::Gdi::InvalidateRect(Some(app.flyout), None, true);
+                }
+                _ => {}
+            });
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
@@ -557,7 +618,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_DESTROY => {
-            if let Some(app) = app_from(hwnd) {
+            with_app(hwnd, |app| {
                 app.set_hotkeys(false);
                 if let Some(p) = app.power.take() {
                     let _ = UnregisterPowerSettingNotification(p);
@@ -566,7 +627,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 icon::destroy(app.icon);
                 app.hide_flyout();
                 app.softdim.destroy_all();
-            }
+            });
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -575,9 +636,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 }
 
 pub fn find_running() -> Option<HWND> {
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::FindWindowW(CLASS, w!("LuxTray")).ok()
-    }
+    unsafe { windows::Win32::UI::WindowsAndMessaging::FindWindowW(CLASS, w!("LuxTray")).ok() }
 }
 
 pub fn activate_existing(hidden: HWND) {
@@ -616,5 +675,22 @@ pub fn activate_existing(hidden: HWND) {
             let _ = BringWindowToTop(flyout);
             let _ = SetForegroundWindow(flyout);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("显示器", 8), "显示器");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate("abcdefghijk", 10), "abcdefghij…");
+        assert_eq!(truncate("内置屏幕亮度", 3), "内置屏…");
     }
 }

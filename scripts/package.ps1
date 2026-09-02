@@ -7,7 +7,20 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
-$version = "0.1.0"
+function Get-CrateVersion {
+    $toml = Join-Path $root "Cargo.toml"
+    $inPackage = $false
+    foreach ($line in Get-Content -Path $toml) {
+        if ($line -match '^\[package\]') { $inPackage = $true; continue }
+        if ($inPackage -and $line -match '^\[') { break }
+        if ($inPackage -and $line -match '^version\s*=\s*"([^"]+)"') {
+            return $Matches[1]
+        }
+    }
+    throw "version not found in Cargo.toml [package]"
+}
+
+$version = Get-CrateVersion
 $dist = Join-Path $root "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
@@ -63,7 +76,7 @@ if ($Installer -or $iscc) {
         return
     }
     Write-Host "Building installer with Inno Setup..."
-    & $iscc (Join-Path $root "pack\luxtray.iss")
+    & $iscc "/DMyAppVersion=$version" (Join-Path $root "pack\luxtray.iss")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $setup = Join-Path $dist "LuxTray-$version-setup.exe"
     if (Test-Path $setup) {
