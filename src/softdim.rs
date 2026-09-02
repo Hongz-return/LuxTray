@@ -1,33 +1,23 @@
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetStockObject, BLACK_BRUSH, HBRUSH,
-};
+use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, MoveWindow,
-    RegisterClassExW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, CS_HREDRAW,
-    CS_VREDRAW, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOWNOACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, MoveWindow, RegisterClassExW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST,
+    LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+    WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::monitors::{self, Monitor};
 
 const CLASS: windows::core::PCWSTR = w!("LuxTrayDim");
 
+#[derive(Default)]
 pub struct SoftDim {
     windows: Vec<(String, HWND)>,
     class_ready: bool,
-}
-
-impl Default for SoftDim {
-    fn default() -> Self {
-        Self {
-            windows: Vec::new(),
-            class_ready: false,
-        }
-    }
 }
 
 impl SoftDim {
@@ -80,7 +70,7 @@ impl SoftDim {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(overlay_proc),
                 hInstance: hinstance.into(),
-                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0 as *mut core::ffi::c_void),
+                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
                 lpszClassName: CLASS,
                 ..Default::default()
             };
@@ -100,11 +90,7 @@ fn create(rect: RECT, alpha: u8) -> windows::core::Result<HWND> {
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED
-                | WS_EX_TRANSPARENT
-                | WS_EX_NOACTIVATE
-                | WS_EX_TOOLWINDOW
-                | WS_EX_TOPMOST,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             CLASS,
             w!(""),
             WS_POPUP,
@@ -136,7 +122,12 @@ fn update(hwnd: HWND, rect: RECT, alpha: u8) {
             let _ = ShowWindow(hwnd, SW_HIDE);
             return;
         }
-        let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), alpha, LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            alpha,
+            LWA_ALPHA,
+        );
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),

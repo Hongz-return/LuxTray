@@ -1,5 +1,5 @@
 use anyhow::Result;
-use windows::core::{w, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP,
@@ -17,13 +17,15 @@ pub struct TrayIcon {
 
 impl TrayIcon {
     pub fn add(hwnd: HWND, icon: HICON, tip: &str) -> Result<Self> {
-        let mut data = NOTIFYICONDATAW::default();
-        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = hwnd;
-        data.uID = TRAY_ID;
-        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-        data.uCallbackMessage = WM_TRAY;
-        data.hIcon = icon;
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+            uCallbackMessage: WM_TRAY,
+            hIcon: icon,
+            ..Default::default()
+        };
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         copy_tip(&mut data.szTip, tip);
 
@@ -80,7 +82,11 @@ fn copy_tip(buf: &mut [u16; 128], tip: &str) {
 
 fn copy_wide(buf: &mut [u16], text: &str) {
     buf.fill(0);
-    for (i, c) in text.encode_utf16().take(buf.len().saturating_sub(1)).enumerate() {
+    for (i, c) in text
+        .encode_utf16()
+        .take(buf.len().saturating_sub(1))
+        .enumerate()
+    {
         buf[i] = c;
     }
 }
@@ -93,38 +99,38 @@ pub fn cursor_pos() -> POINT {
     pt
 }
 
-pub fn show_context_menu(hwnd: HWND, items: &[(&str, u32)]) {
+pub fn show_context_menu(hwnd: HWND, items: &[(String, u32)]) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, InsertMenuW, TrackPopupMenu, HMENU, MF_BYPOSITION,
-        MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-        SetForegroundWindow,
+        CreatePopupMenu, DestroyMenu, InsertMenuW, SetForegroundWindow, TrackPopupMenu,
+        MF_BYPOSITION, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        TPM_RIGHTBUTTON,
     };
     unsafe {
-        let menu = CreatePopupMenu().unwrap_or(HMENU::default());
+        let menu = CreatePopupMenu().unwrap_or_default();
         if menu.is_invalid() {
             return;
         }
         for (i, (label, id)) in items.iter().enumerate() {
             if *id == 0 {
-                let _ = InsertMenuW(menu, i as u32, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+                let _ = InsertMenuW(
+                    menu,
+                    i as u32,
+                    MF_BYPOSITION | MF_SEPARATOR,
+                    0,
+                    PCWSTR::null(),
+                );
                 continue;
             }
             let mut flags = MF_BYPOSITION | MF_STRING;
-            let text = if label.starts_with('*') {
+            let text = if let Some(rest) = label.strip_prefix('*') {
                 flags |= MF_CHECKED;
-                &label[1..]
+                rest
             } else {
-                *label
+                label.as_str()
             };
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             wide.push(0);
-            let _ = InsertMenuW(
-                menu,
-                i as u32,
-                flags,
-                *id as usize,
-                PCWSTR(wide.as_ptr()),
-            );
+            let _ = InsertMenuW(menu, i as u32, flags, *id as usize, PCWSTR(wide.as_ptr()));
         }
         let pt = cursor_pos();
         let _ = SetForegroundWindow(hwnd);
@@ -144,6 +150,5 @@ pub fn show_context_menu(hwnd: HWND, items: &[(&str, u32)]) {
             LPARAM(0),
         );
         let _ = DestroyMenu(menu);
-        let _ = w!("LuxTray");
     }
 }
